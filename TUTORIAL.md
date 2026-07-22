@@ -14,8 +14,8 @@
 | --- | --- | --- |
 | 1 | 环境准备与依赖安装 | ✅ 已完成 |
 | 2 | 配置 DeepSeek API Key | ✅ 已完成 |
-| 3 | 第一个 LLM 调用 | ⏳ 进行中 |
-| 4 | Prompt Template 提示词模板 | 未开始 |
+| 3 | 第一个 LLM 调用 | ✅ 已完成 |
+| 4 | Prompt Template 提示词模板 | ⏳ 进行中 |
 | 5 | LCEL 链式调用 | 未开始 |
 | 6 | 输出解析 Output Parser | 未开始 |
 | 7 | 对话记忆 Memory | 未开始 |
@@ -75,3 +75,48 @@ python-dotenv==1.2.2
 - **密钥绝不写死在代码里、也不提交到 Git**：一旦密钥被提交过一次，即使后来删除，它依然会留在 Git 历史记录里，别人 clone 仓库后用 `git log` 就能翻出来。用 `.env` + `.gitignore` 是业界标准做法。
 - **`.env.example` 提交、`.env` 不提交**：这样任何人拿到这个仓库，都能通过 `.env.example` 知道项目需要哪些环境变量，自己复制一份填上真实值即可，不需要额外的文档说明配置项。
 - 用 `python-dotenv` 而不是要求用户每次手动 `set` 环境变量，是因为 `.env` 文件形式更方便管理多个变量，且和几乎所有 Python 项目、部署平台（Docker、CI）的约定一致。
+
+---
+
+## 第 3 步：第一个 LLM 调用
+
+### 做了什么
+
+新增 `03_first_llm_call.py`：
+
+```python
+import os
+
+from dotenv import load_dotenv
+from langchain_openai import ChatOpenAI
+
+load_dotenv()
+
+llm = ChatOpenAI(
+    model="deepseek-chat",
+    api_key=os.getenv("DEEPSEEK_API_KEY"),
+    base_url="https://api.deepseek.com/v1",
+)
+
+response = llm.invoke("你好，用一句话介绍一下你自己")
+print(response.content)
+```
+
+运行 `.venv/Scripts/python.exe 03_first_llm_call.py`，实际输出：
+
+```
+你好！我是 DeepSeek，一个由深度求索公司开发的免费 AI 助手，能帮你解答问题、处理文档、分析信息，还能陪你聊天～
+```
+
+代码逐行拆解：
+
+- `ChatOpenAI(...)`：LangChain 里对接“类 OpenAI 协议”聊天模型的标准类。三个关键参数：
+  - `model`：DeepSeek 这边对话模型的名字是 `deepseek-chat`（官方还有一个 `deepseek-reasoner` 推理模型，之后可以试试换成它对比效果）。
+  - `api_key`：从上一步 `.env` 里读出来的密钥，`load_dotenv()` 已经把它放进了环境变量。
+  - `base_url`：这是让 `ChatOpenAI` 从访问 OpenAI 官方接口，改成访问 DeepSeek 接口地址的关键一行，其他参数和用法完全不变。
+- `llm.invoke("...")`：向模型发送一次请求并同步等待返回，返回值是一个 `AIMessage` 对象，`.content` 是其中的文本内容（这个对象还携带了其他信息，比如 token 用量，后面用到时再展开）。
+
+### 为什么这样做
+
+- 只改 `base_url` 就能切换服务商，正是第 1 步选择 `langchain-openai` 而不是厂商专属 SDK 的价值所在：一套写法，换厂商不用重学。
+- 用 `llm.invoke()` 而不是更底层的 `requests.post()` 直接调 HTTP 接口，是因为 LangChain 把请求组装、重试、返回结构解析都封装好了，后面学 Prompt Template、Chain、Agent 时都建立在这同一个 `llm` 对象之上，不需要重复造轮子。
