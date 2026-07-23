@@ -15,8 +15,8 @@
 | 1 | 环境准备与依赖安装 | ✅ 已完成 |
 | 2 | 配置 DeepSeek API Key | ✅ 已完成 |
 | 3 | 第一个 LLM 调用 | ✅ 已完成 |
-| 4 | Prompt Template 提示词模板 | ⏳ 进行中 |
-| 5 | LCEL 链式调用 | 未开始 |
+| 4 | Prompt Template 提示词模板 | ✅ 已完成 |
+| 5 | LCEL 链式调用 | ⏳ 进行中 |
 | 6 | 输出解析 Output Parser | 未开始 |
 | 7 | 对话记忆 Memory | 未开始 |
 | 8 | 工具调用与 Agent | 未开始 |
@@ -120,3 +120,51 @@ print(response.content)
 
 - 只改 `base_url` 就能切换服务商，正是第 1 步选择 `langchain-openai` 而不是厂商专属 SDK 的价值所在：一套写法，换厂商不用重学。
 - 用 `llm.invoke()` 而不是更底层的 `requests.post()` 直接调 HTTP 接口，是因为 LangChain 把请求组装、重试、返回结构解析都封装好了，后面学 Prompt Template、Chain、Agent 时都建立在这同一个 `llm` 对象之上，不需要重复造轮子。
+
+---
+
+## 第 4 步：Prompt Template 提示词模板
+
+### 做了什么
+
+上一步里，发给模型的话是硬编码的字符串 `"你好，用一句话介绍一下你自己"`。真实场景里，提示词的“骨架”通常是固定的，变化的只是其中几个变量（比如用户输入的内容、目标语言、角色设定等）。`ChatPromptTemplate` 就是用来把“骨架”和“变量”拆开管理的工具。
+
+新增 `04_prompt_template.py`，做了一个翻译小助手：
+
+```python
+from langchain_core.prompts import ChatPromptTemplate
+
+prompt = ChatPromptTemplate.from_messages(
+    [
+        ("system", "你是一个专业翻译，把用户输入的内容翻译成{language}，只输出翻译结果，不要多余解释。"),
+        ("human", "{text}"),
+    ]
+)
+
+messages = prompt.format_messages(language="英文", text="今天天气真好，我们去公园散步吧。")
+```
+
+- `from_messages([...])`：定义一段“对话骨架”，每一项是 `(角色, 模板字符串)`。这里用了两种角色：
+  - `"system"`：系统提示，通常用来设定模型的角色/行为规则，用户看不到这段话，但它会影响模型每次的回答方式。
+  - `"human"`：用户说的话。
+  - 模板字符串里的 `{language}`、`{text}` 是占位符，语法上和 Python 的 `str.format()` 一致。
+- `prompt.format_messages(language="英文", text="...")`：把占位符换成真实的值，返回一个消息列表。运行后打印出来是：
+
+  ```python
+  [SystemMessage(content='你是一个专业翻译，把用户输入的内容翻译成英文，只输出翻译结果，不要多余解释。', ...),
+   HumanMessage(content='今天天气真好，我们去公园散步吧。', ...)]
+  ```
+
+  可以看到，`ChatPromptTemplate` 最终产出的还是上一步里 `llm.invoke()` 认识的那种消息对象（`SystemMessage`/`HumanMessage`），只是不用我们手写了。
+
+- 把这个消息列表传给 `llm.invoke(messages)`，实际输出：
+
+  ```
+  The weather is so nice today. Let's go for a walk in the park.
+  ```
+
+### 为什么这样做
+
+- **骨架和变量分离**：如果不用模板，每次换一个用户输入，都要自己拼字符串、小心处理换行和转义；有了模板，只需要传变量，模板本身可以被复用、被测试、被单独维护（比如以后把提示词存成配置文件，不用改代码）。
+- **`system` 角色的意义**：把“翻译规则”放进 `system` 而不是拼进 `human` 消息里，是因为多数模型（包括 DeepSeek）会更稳定地遵守 `system` 里的设定，且用户消息里只保留“真正要处理的内容”，两者职责分开后更容易复用同一套 `system` 提示词处理不同的用户输入。
+- 目前是手动调用 `format_messages()` 再手动调用 `llm.invoke()`，这两步之间的“胶水代码”正是下一步 LCEL 要解决的问题——把 `prompt` 和 `llm`直接“粘”成一条链。
