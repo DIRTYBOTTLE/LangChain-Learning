@@ -16,8 +16,8 @@
 | 2 | 配置 DeepSeek API Key | ✅ 已完成 |
 | 3 | 第一个 LLM 调用 | ✅ 已完成 |
 | 4 | Prompt Template 提示词模板 | ✅ 已完成 |
-| 5 | LCEL 链式调用 | ⏳ 进行中 |
-| 6 | 输出解析 Output Parser | 未开始 |
+| 5 | LCEL 链式调用 | ✅ 已完成 |
+| 6 | 输出解析 Output Parser | ⏳ 进行中 |
 | 7 | 对话记忆 Memory | 未开始 |
 | 8 | 工具调用与 Agent | 未开始 |
 | 9 | RAG 检索增强问答（可选） | 未开始 |
@@ -168,3 +168,44 @@ messages = prompt.format_messages(language="英文", text="今天天气真好，
 - **骨架和变量分离**：如果不用模板，每次换一个用户输入，都要自己拼字符串、小心处理换行和转义；有了模板，只需要传变量，模板本身可以被复用、被测试、被单独维护（比如以后把提示词存成配置文件，不用改代码）。
 - **`system` 角色的意义**：把“翻译规则”放进 `system` 而不是拼进 `human` 消息里，是因为多数模型（包括 DeepSeek）会更稳定地遵守 `system` 里的设定，且用户消息里只保留“真正要处理的内容”，两者职责分开后更容易复用同一套 `system` 提示词处理不同的用户输入。
 - 目前是手动调用 `format_messages()` 再手动调用 `llm.invoke()`，这两步之间的“胶水代码”正是下一步 LCEL 要解决的问题——把 `prompt` 和 `llm`直接“粘”成一条链。
+
+---
+
+## 第 5 步：LCEL 链式调用
+
+### 做了什么
+
+上一步的用法是：
+
+```python
+messages = prompt.format_messages(language="英文", text="...")
+response = llm.invoke(messages)
+```
+
+两行代码、两个独立的调用。LCEL（LangChain Expression Language）用 `|` 运算符把它们合并成一条“链”，新增的 `05_lcel_chain.py` 把 `prompt` 和 `llm` 拼在了一起：
+
+```python
+chain = prompt | llm
+
+response = chain.invoke({"language": "英文", "text": "今天天气真好，我们去公园散步吧。"})
+print(response.content)
+```
+
+运行结果和上一步完全一样：
+
+```
+The weather is so nice today. Let's go for a walk in the park.
+```
+
+`chain = prompt | llm` 这一行，把两个组件（`prompt` 和 `llm`）组合成了一个新的可运行对象 `chain`。调用 `chain.invoke(变量字典)` 时，LangChain 在背后做的事情，其实就是把上一步的两行代码自动串起来：
+
+1. 先把传入的字典 `{"language": ..., "text": ...}` 交给 `prompt`，等价于 `prompt.format_messages(**输入)`，产出消息列表；
+2. 再把这个消息列表自动交给 `llm`，等价于 `llm.invoke(消息列表)`，产出最终的 `AIMessage`。
+
+也就是说，`chain.invoke(x)` 约等于 `llm.invoke(prompt.format_messages(**x))`，只是不需要我们手动写中间那一步、也不需要关心上一环节的输出格式是否匹配下一环节的输入格式——只要用 `|` 连起来，LangChain 就负责对接好。
+
+### 为什么这样做
+
+- **可读性**：`prompt | llm` 这种写法本身就在描述“数据先经过 prompt，再经过 llm”，比看两行分散的赋值语句更直观地表达出处理流程。
+- **可扩展性**：`|` 可以一直往后接，比如 `prompt | llm | 某个后处理组件 | 另一个组件`，管道有多长都是同样的写法。下一步要学的 `StrOutputParser` 就是接在 `llm` 后面的第三个环节，用来把 `AIMessage` 对象变成一个纯字符串。
+- **统一接口**：`prompt`、`llm`，以及后面会遇到的 parser、retriever 等，都实现了同一套“可运行（Runnable）”接口（`invoke`/`batch`/`stream` 等），这也是它们能用同一个 `|` 运算符自由拼接的原因——这是 LangChain 目前的核心设计范式，比早期版本里各种专用的 `XXXChain` 类更统一、更灵活。
