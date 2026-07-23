@@ -18,8 +18,8 @@
 | 4 | Prompt Template 提示词模板 | ✅ 已完成 |
 | 5 | LCEL 链式调用 | ✅ 已完成 |
 | 6 | 输出解析 Output Parser | ✅ 已完成 |
-| 7 | 对话记忆 Memory | ⏳ 进行中 |
-| 8 | 工具调用与 Agent | 未开始 |
+| 7 | 对话记忆 Memory | ✅ 已完成 |
+| 8 | 工具调用与 Agent | ⏳ 进行中 |
 | 9 | RAG 检索增强问答（可选） | 未开始 |
 
 ---
@@ -263,3 +263,60 @@ structured_result = structured_chain.invoke({"language": "英文", "text": "今�
 - **`StrOutputParser` 的意义**：当下游只关心文本内容（比如要把结果存进数据库、展示在页面上）时，链的调用方不需要知道也不用关心 `AIMessage` 的存在，直接拿字符串最省心。这也是为什么它常被放在生产环境链路的最后一环。
 - **结构化输出的意义**：如果程序要根据模型的返回结果做进一步逻辑判断（比如 `if source_language == "中文"`），解析裸文本 / JSON 字符串既啰嗦又脆弱（模型偶尔可能多输出几个字、格式对不齐）。`with_structured_output` 把“保证返回格式正确”这件事交给了 LangChain 和模型的 function calling 能力去做，程序里直接用属性访问，健壮性更好。
 - 两种方式本质上都是在 `prompt | llm` 这条链的末端多接一环——`StrOutputParser()` 是接在 `llm` 后面的独立组件，而 `with_structured_output` 是直接对 `llm` 这个对象做了包装（返回一个新的、行为不同的可运行对象），两种思路后面在 Agent、RAG 里都会反复用到。
+
+---
+
+## 第 7 步：对话记忆 Memory
+
+### 做了什么
+
+前面几步每次 `invoke` 都是独立的一轮问答，模型不知道上一轮聊了什么——因为压根没把上一轮的内容发给它。LLM 本身是无状态的，所谓“记忆”，其实就是**把之前的对话历史，跟着这一轮的问题一起再发一遍**。
+
+新增 `07_memory.py`：
+
+```python
+prompt = ChatPromptTemplate.from_messages(
+    [
+        ("system", "你是一个友好的助手，会记住之前聊过的内容。"),
+        MessagesPlaceholder("history"),
+        ("human", "{input}"),
+    ]
+)
+
+chain = prompt | llm
+
+history = []
+
+
+def chat(user_input):
+    response = chain.invoke({"history": history, "input": user_input})
+    history.append(HumanMessage(content=user_input))
+    history.append(response)
+    print(f"用户: {user_input}")
+    print(f"助手: {response.content}\n")
+
+
+chat("我叫小明，最喜欢的水果是芒果。")
+chat("你还记得我的名字和喜欢的水果吗？")
+```
+
+运行结果：
+
+```
+用户: 我叫小明，最喜欢的水果是芒果。
+助手: 你好小明！很高兴认识你，我记得你最喜欢的水果是芒果啦！...
+
+用户: 你还记得我的名字和喜欢的水果吗？
+助手: 当然记得呀！你叫小明，最喜欢的水果是芒果...
+```
+
+关键的两处：
+
+- `MessagesPlaceholder("history")`：在模板骨架里挖了一个“坑”，专门用来插入一整段消息列表（而不是像 `{text}` 那样只能填一个字符串）。调用时传入 `history=history`，这个列表里有多少条消息，就会原样插入多少条。
+- `history` 是一个普通的 Python 列表，由**我们自己**在每次调用后维护：先调用 `chain.invoke(...)` 拿到回复，再手动把这一轮的 `HumanMessage` 和模型返回的 `AIMessage` 都追加进 `history`，下一轮调用时它们就会被当成“上下文”一起发给模型。
+
+### 为什么这样做
+
+- **LLM 没有记忆，“记忆”是应用层的责任**：这是理解所有对话式 AI 应用的关键前提。无论是 ChatGPT 网页版的多轮对话，还是这里的例子，本质上都是客户端/服务端把历史消息缓存下来，每次请求时完整或裁剪后再发一遍。理解了这一点，就能理解为什么对话越长、每次请求消耗的 token 越多——历史都要重新发送。
+- **先手写 `history` 列表，而不是直接用 LangChain 提供的 `RunnableWithMessageHistory` 封装**：是想先把“记忆”背后最原始的机制搞清楚（无非就是一个消息列表 + 每轮追加）。等这个机制理解了，官方封装的 `RunnableWithMessageHistory`（可以按 `session_id` 自动管理多个用户各自的历史，并支持接入 Redis 等持久化存储）只是把“手动维护 `history` 列表”这件事自动化了，不会再显得神秘。
+- 这里用最简单的“全量历史都发给模型”策略。真实项目里，历史一长会超出模型的上下文长度限制、也会增加成本，通常还需要做**历史裁剪/摘要**（比如只保留最近 N 轮，或者定期把旧对话总结成一段摘要），这个优化点先了解，之后有需要可以再深入。
