@@ -17,8 +17,8 @@
 | 3 | 第一个 LLM 调用 | ✅ 已完成 |
 | 4 | Prompt Template 提示词模板 | ✅ 已完成 |
 | 5 | LCEL 链式调用 | ✅ 已完成 |
-| 6 | 输出解析 Output Parser | ⏳ 进行中 |
-| 7 | 对话记忆 Memory | 未开始 |
+| 6 | 输出解析 Output Parser | ✅ 已完成 |
+| 7 | 对话记忆 Memory | ⏳ 进行中 |
 | 8 | 工具调用与 Agent | 未开始 |
 | 9 | RAG 检索增强问答（可选） | 未开始 |
 
@@ -209,3 +209,57 @@ The weather is so nice today. Let's go for a walk in the park.
 - **可读性**：`prompt | llm` 这种写法本身就在描述“数据先经过 prompt，再经过 llm”，比看两行分散的赋值语句更直观地表达出处理流程。
 - **可扩展性**：`|` 可以一直往后接，比如 `prompt | llm | 某个后处理组件 | 另一个组件`，管道有多长都是同样的写法。下一步要学的 `StrOutputParser` 就是接在 `llm` 后面的第三个环节，用来把 `AIMessage` 对象变成一个纯字符串。
 - **统一接口**：`prompt`、`llm`，以及后面会遇到的 parser、retriever 等，都实现了同一套“可运行（Runnable）”接口（`invoke`/`batch`/`stream` 等），这也是它们能用同一个 `|` 运算符自由拼接的原因——这是 LangChain 目前的核心设计范式，比早期版本里各种专用的 `XXXChain` 类更统一、更灵活。
+
+---
+
+## 第 6 步:输出解析 Output Parser
+
+### 做了什么
+
+到目前为止，`chain.invoke(...)` 拿到的都是一个 `AIMessage` 对象，要用 `.content` 才能取出文本。新增 `06_output_parser.py`，演示两种更进一步的输出解析方式。
+
+**1）`StrOutputParser`：接到纯字符串**
+
+```python
+str_chain = prompt | llm | StrOutputParser()
+result = str_chain.invoke({"language": "英文", "text": "今天天气真好，我们去公园散步吧。"})
+```
+
+在链的末尾再接一个 `StrOutputParser()`，`chain.invoke(...)` 的返回值就直接是字符串本身，不再是 `AIMessage` 对象，也就不用再手写 `.content` 了。运行结果：
+
+```
+True The weather is lovely today. Let's go for a walk in the park.
+```
+
+（`True` 是 `isinstance(result, str)` 的结果，用来证明返回值就是一个普通字符串。）
+
+**2）结构化输出：直接拿到一个 Python 对象**
+
+有时候我们不只是要一段文本，而是要模型返回“翻译结果 + 识别出的原文语言”这种带多个字段的结构化数据。用 `pydantic.BaseModel` 描述期望的字段，交给 `llm.with_structured_output(...)`：
+
+```python
+class Translation(BaseModel):
+    translated_text: str = Field(description="翻译后的文本")
+    source_language: str = Field(description="识别出的原文语言，例如：中文")
+
+
+structured_llm = llm.with_structured_output(Translation, method="function_calling")
+structured_chain = prompt | structured_llm
+structured_result = structured_chain.invoke({"language": "英文", "text": "今天天气真好，我们去公园散步吧。"})
+```
+
+运行结果：
+
+```
+<class '__main__.Translation'> translated_text="The weather is so nice today. Let's go for a walk in the park." source_language='中文'
+```
+
+`structured_result` 已经是一个 `Translation` 实例，可以直接用 `structured_result.translated_text`、`structured_result.source_language` 访问字段，不需要自己写正则或者手动解析 JSON。
+
+> **踩坑记录**：`with_structured_output` 默认会尝试用最新的 `response_format`（JSON Schema）方式让模型返回结构化数据，但 DeepSeek 当前的 API 还不支持这种方式，会报错 `This response_format type is unavailable now`。解决办法是显式传 `method="function_calling"`，改用“函数调用”的方式实现结构化输出——这是一种更通用、几乎所有支持 tool calling 的模型都兼容的方式。
+
+### 为什么这样做
+
+- **`StrOutputParser` 的意义**：当下游只关心文本内容（比如要把结果存进数据库、展示在页面上）时，链的调用方不需要知道也不用关心 `AIMessage` 的存在，直接拿字符串最省心。这也是为什么它常被放在生产环境链路的最后一环。
+- **结构化输出的意义**：如果程序要根据模型的返回结果做进一步逻辑判断（比如 `if source_language == "中文"`），解析裸文本 / JSON 字符串既啰嗦又脆弱（模型偶尔可能多输出几个字、格式对不齐）。`with_structured_output` 把“保证返回格式正确”这件事交给了 LangChain 和模型的 function calling 能力去做，程序里直接用属性访问，健壮性更好。
+- 两种方式本质上都是在 `prompt | llm` 这条链的末端多接一环——`StrOutputParser()` 是接在 `llm` 后面的独立组件，而 `with_structured_output` 是直接对 `llm` 这个对象做了包装（返回一个新的、行为不同的可运行对象），两种思路后面在 Agent、RAG 里都会反复用到。
