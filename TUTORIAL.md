@@ -19,8 +19,8 @@
 | 5 | LCEL 链式调用 | ✅ 已完成 |
 | 6 | 输出解析 Output Parser | ✅ 已完成 |
 | 7 | 对话记忆 Memory | ✅ 已完成 |
-| 8 | 工具调用与 Agent | ⏳ 进行中 |
-| 9 | RAG 检索增强问答（可选） | 未开始 |
+| 8 | 工具调用与 Agent | ✅ 已完成 |
+| 9 | RAG 检索增强问答（可选） | ⏳ 进行中 |
 
 ---
 
@@ -320,3 +320,100 @@ chat("你还记得我的名字和喜欢的水果吗？")
 - **LLM 没有记忆，“记忆”是应用层的责任**：这是理解所有对话式 AI 应用的关键前提。无论是 ChatGPT 网页版的多轮对话，还是这里的例子，本质上都是客户端/服务端把历史消息缓存下来，每次请求时完整或裁剪后再发一遍。理解了这一点，就能理解为什么对话越长、每次请求消耗的 token 越多——历史都要重新发送。
 - **先手写 `history` 列表，而不是直接用 LangChain 提供的 `RunnableWithMessageHistory` 封装**：是想先把“记忆”背后最原始的机制搞清楚（无非就是一个消息列表 + 每轮追加）。等这个机制理解了，官方封装的 `RunnableWithMessageHistory`（可以按 `session_id` 自动管理多个用户各自的历史，并支持接入 Redis 等持久化存储）只是把“手动维护 `history` 列表”这件事自动化了，不会再显得神秘。
 - 这里用最简单的“全量历史都发给模型”策略。真实项目里，历史一长会超出模型的上下文长度限制、也会增加成本，通常还需要做**历史裁剪/摘要**（比如只保留最近 N 轮，或者定期把旧对话总结成一段摘要），这个优化点先了解，之后有需要可以再深入。
+
+---
+
+## 第 8 步：工具调用与 Agent
+
+### 做了什么
+
+到目前为止，模型只能凭“记忆里的知识”回答问题，答不了实时信息（今天天气、当前时间），也做不了精确计算（大语言模型本质是在“猜”下一个字，算数经常不准）。**工具调用（Tool Calling）**让模型可以说“这个我不会，帮我调用一下某个函数，把结果告诉我”，由我们的代码去真正执行这个函数。
+
+新增 `08_tools_and_agent.py`，分两部分。
+
+**1）先定义两个工具：**
+
+```python
+from langchain_core.tools import tool
+
+@tool
+def get_weather(city: str) -> str:
+    """查询指定城市当前的天气情况。"""
+    fake_weather_db = {"北京": "晴，25°C", "上海": "多云，28°C"}
+    return fake_weather_db.get(city, f"暂无 {city} 的天气数据")
+
+
+@tool
+def add(a: float, b: float) -> float:
+    """计算两个数字相加的结果。"""
+    return a + b
+```
+
+`@tool` 装饰器把一个普通 Python 函数包装成 LangChain 认识的“工具”对象。这里的**函数签名**（参数名、类型）和**函数的 docstring**都不是随便写的：它们会被自动转换成一份工具说明书（名字、参数、用途描述）发给模型，模型正是靠读这份说明书来判断“这个问题该不该用工具、该用哪个、参数怎么填”。`get_weather` 用的是写死的假数据，重点是演示机制，不是真的接天气 API。
+
+**2）手动实现一遍“工具调用循环”，看清背后的机制：**
+
+```python
+llm_with_tools = llm.bind_tools(tools)
+
+messages = [HumanMessage(content="北京今天天气怎么样？")]
+ai_message = llm_with_tools.invoke(messages)
+print("模型决定调用的工具：", ai_message.tool_calls)
+
+messages.append(ai_message)
+for tool_call in ai_message.tool_calls:
+    selected_tool = tools_by_name[tool_call["name"]]
+    tool_message = selected_tool.invoke(tool_call)
+    messages.append(tool_message)
+
+final_response = llm_with_tools.invoke(messages)
+print("最终回答：", final_response.content)
+```
+
+运行结果：
+
+```
+模型决定调用的工具： [{'name': 'get_weather', 'args': {'city': '北京'}, 'id': '...', 'type': 'tool_call'}]
+最终回答： 北京今天天气**晴**，气温 **25°C**...
+```
+
+这一步的关键在于，**模型本身不会“执行”任何工具**，它只是在第一次 `invoke` 时返回了一个特殊的 `AIMessage`，其中 `tool_calls` 字段写着“我想调用 `get_weather`，参数是 `city=北京`”。真正调用 `get_weather` 这个函数、拿到 `"晴，25°C"` 这个字符串的，是我们自己写的这几行 `for` 循环代码。拿到结果后，把它包装成一条 `ToolMessage` 追加进 `messages`，再把完整的对话历史（问题 + 模型的调用请求 + 工具的执行结果）第二次发给模型，模型才基于这个结果生成了最终的自然语言回答。
+
+**3）用官方 `create_agent` 封装同一个能力：**
+
+```python
+from langchain.agents import create_agent
+
+agent = create_agent(llm, tools=tools)
+result = agent.invoke({"messages": [HumanMessage(content="上海天气怎么样？另外，3.5 加 2.7 等于多少？")]})
+```
+
+运行结果（`m.pretty_print()` 把每条消息按类型打印出来）：
+
+```
+================================ Human Message =================================
+上海天气怎么样？另外，3.5 加 2.7 等于多少？
+================================== Ai Message ==================================
+好的，我来同时查询这两个信息。
+Tool Calls:
+  get_weather(city: 上海)
+  add(a: 3.5, b: 2.7)
+================================= Tool Message =================================
+Name: get_weather
+多云，28°C
+================================= Tool Message =================================
+Name: add
+6.2
+================================== Ai Message ==================================
+为你查询到以下信息：
+1. **上海天气**：目前是多云，气温 **28°C**。
+2. **3.5 + 2.7**：等于 **6.2**。
+```
+
+`create_agent` 把第 2 部分里手写的“调用模型 → 检查有没有工具调用请求 → 执行工具 → 把结果发回去 → 再调用模型”这一整套循环封装好了，还自动支持了**一次并行调用多个工具**（这次模型一口气决定同时查天气和算加法，我们手写的简化版循环里没有处理并行的情况）。
+
+### 为什么这样做
+
+- **先手动实现一遍再用封装**：和第 7 步的思路一致。工具调用最容易让初学者困惑的地方，就是误以为“模型自己执行了函数”。手写一遍循环之后就会清楚：工具调用的本质仍然是消息的来回传递（一个特殊格式的 `AIMessage` → 我们执行代码 → 一个 `ToolMessage`），模型自己不具备执行任何代码的能力。
+- **为什么工具函数要写清楚 docstring 和类型注解**：这是模型判断“该不该调用、调用哪个、参数怎么填”的唯一依据。如果 docstring 写得模糊，模型很可能选错工具或者编造参数，这是实际项目里工具调用出错的最常见原因之一。
+- **`create_agent` 什么时候该用**：当工具不止一两个、可能需要连续调用好几轮（比如先查天气，再根据天气结果决定要不要调用另一个工具）时，手写循环会变得繁琐且容易漏掉边界情况（比如这里演示的并行工具调用）。`create_agent` 基于 LangGraph 实现，是 LangChain 1.x 里官方推荐的 Agent 构建方式。
