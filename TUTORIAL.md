@@ -22,6 +22,7 @@
 | 8 | 工具调用与 Agent | ✅ 已完成 |
 | 9 | RAG 检索增强问答（可选） | ✅ 已完成 |
 | 10 | 流式输出 Streaming | ✅ 已完成 |
+| 11 | 持久化向量库 | ✅ 已完成 |
 
 ---
 
@@ -528,3 +529,55 @@ for chunk in chain.stream({"language": "英文", "text": "秋天到了，树叶�
 - **用户体验**：等待时间不变的情况下，让内容尽快开始展示，用户会感觉“响应更快”——这是所有对话式产品都做流式输出的根本原因，尤其是回答比较长的时候（比如这一步的例子），一次性等待和边生成边看的体验差异非常明显。
 - **`invoke()` 和 `stream()` 该怎么选**：如果程序需要拿到完整结果做进一步处理（比如上一步 RAG 里，要先判断检索结果是否为空、要把 `AIMessage.content` 交给下一个函数处理结构化数据），那就适合用 `invoke()`；如果结果是直接展示给终端用户看的（网页聊天界面、命令行工具的最终回答），用 `stream()` 几乎总是体验更好、没有额外代价。
 - **`create_agent` 的流式输出是另一回事**：第 8 步的 Agent 因为背后是一个“调用模型 → 判断要不要调用工具 → 执行工具 → 再调用模型”的多步骤循环（用 LangGraph 实现），它的 `.stream(...)` 默认按“每完成一个步骤就产出一次结果”来流式输出，而不是像这里一样按 token 级别流式输出文字。如果想要 Agent 在生成最终自然语言回答时也做到逐字流式，需要用它更细粒度的流式模式（`stream_mode="messages"`），这个留到之后有实际需要时再深入，这里先了解“流式”在“单次模型调用”和“多步骤 Agent”里是两个不同层面的概念即可。
+
+---
+
+## 第 11 步：持久化向量库
+
+### 做了什么
+
+第 9 步里，每次运行 `09_rag.py`，程序都会重新执行一遍“读文档 → 切分 → 把每一段都丢给 embedding 模型算一遍向量”，`InMemoryVectorStore` 里的数据只存在这一次进程的内存里，程序一退出就没了。文档只有 4 段的时候这不是问题，但如果是几千段的真实文档库，每次启动程序都重新计算一遍所有向量，既慢又浪费。
+
+新增 `11_persistent_vector_store.py`，用 `InMemoryVectorStore` 自带的 `dump()` / `load()` 方法把向量库存到磁盘上：
+
+```python
+SOURCE_PATH = "data/company_faq.txt"
+STORE_PATH = "vector_store.json"
+HASH_PATH = "vector_store.hash"
+
+embeddings = HuggingFaceEmbeddings(model_name="BAAI/bge-small-zh-v1.5")
+
+with open(SOURCE_PATH, encoding="utf-8") as f:
+    raw_text = f.read()
+current_hash = hashlib.md5(raw_text.encode("utf-8")).hexdigest()
+
+cached_hash = None
+if os.path.exists(HASH_PATH):
+    with open(HASH_PATH, encoding="utf-8") as f:
+        cached_hash = f.read().strip()
+
+if os.path.exists(STORE_PATH) and cached_hash == current_hash:
+    print(f"源文档未变化，直接加载 {STORE_PATH}，不重新计算 embedding")
+    vector_store = InMemoryVectorStore.load(STORE_PATH, embeddings)
+else:
+    print("源文档是新的或已发生变化，重新构建向量库")
+    # ... 切分、from_texts() 构建 vector_store（和第 9 步一样）
+    vector_store.dump(STORE_PATH)
+    with open(HASH_PATH, "w", encoding="utf-8") as f:
+        f.write(current_hash)
+```
+
+> **第一版少了什么**：最初的实现只判断了“`vector_store.json` 存不存在”——只要文件存在就直接加载，完全没检查 `data/company_faq.txt` 有没有被改过。这样一旦源文档更新了，程序会一直读到过时的向量库，检索出旧内容而不自知，是一个真实的正确性问题。修复方式是给源文档内容算一个 `md5` 哈希，和上次构建时保存的哈希（`vector_store.hash`）比较：只有“向量库文件存在”**并且**“哈希对得上”这两个条件都满足，才走加载分支；哈希对不上（文档变了）或者压根没建过，都会重新构建并把新的哈希存下来。
+
+实测了三种场景，结果都符合预期：
+
+1. **首次运行**（没有 `vector_store.json`/`vector_store.hash`）：重新构建并保存。
+2. **文档没变，再次运行**：哈希一致，直接加载，跳过重新计算向量。
+3. **手动往 `data/company_faq.txt` 里加一条新政策后运行**：哈希对不上，自动重新构建——检索结果里能看到新内容已经生效（验证完之后把这条测试内容还原了，保持和第 9 步文档描述的 4 段内容一致）。
+
+### 为什么这样做
+
+- **省下的是“给文档算向量”这一步，不是“加载 embedding 模型”这一步**：每次运行你都会看到 `Loading weights...` 的进度条，这是在把 `BAAI/bge-small-zh-v1.5` 这个模型加载进内存——因为不管有没有历史数据，用户新提的问题总是要重新转成向量才能去库里检索。真正被跳过的，是对 `data/company_faq.txt` 里那几段文字重新计算向量的过程；文档越多、越大，这部分省下的时间也越多。
+- **为什么用内容哈希而不是文件修改时间（mtime）判断“变没变”**：mtime 容易被“无意义的改动”骗到（比如只是把文件复制到另一台机器、或者 `touch` 了一下但内容没变），也可能因为系统时钟、时区问题不可靠；直接对内容算哈希，只要文字内容一个字节都没变，哈希就不会变，是更严谨、也是缓存失效（cache invalidation）场景里更常见的做法。
+- **`vector_store.json` 和 `vector_store.hash` 都不提交进 Git**：和 `.venv` 一样，它们都是可以从源头（`data/company_faq.txt` + 相同的 embedding 模型）重新生成出来的**派生产物**，不是需要手工维护的源文件，所以都加进了 `.gitignore`。真正该提交的是 `data/company_faq.txt` 这个原始数据，任何人拿到仓库、跑一次脚本，都能自己生成出一样的向量库和哈希文件。
+- **为什么继续用 `InMemoryVectorStore` 而不是直接换成 Chroma/Postgres 等专业的持久化向量数据库**：教学阶段的核心是先理解“持久化”这个概念本身——省去重复计算、数据能跨进程存活。`InMemoryVectorStore.dump()/load()` 用一个 JSON 文件就做到了这一点，不需要再学一个新的数据库系统。等文档量大到一个 JSON 文件不再合适（比如要支持多用户并发读写、要做增量更新），再换成 Chroma、Postgres+pgvector 这类专业方案，那时候 `similarity_search()` 之类的检索代码基本不用改，改的只是vector store 的初始化方式。
