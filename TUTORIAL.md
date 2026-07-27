@@ -25,8 +25,8 @@
 | 11 | 持久化向量库 | ✅ 已完成 |
 | 12 | 整合成一个小应用 | ✅ 已完成 |
 | 13 | LangGraph 基础概念 | ✅ 已完成 |
-| 14 | LangGraph 条件边 | ⏳ 进行中 |
-| 15 | LangGraph 接入 LLM 节点 | 未开始 |
+| 14 | LangGraph 条件边 | ✅ 已完成 |
+| 15 | LangGraph 接入 LLM 节点 | ✅ 已完成 |
 | 16 | LangGraph 手写工具调用循环 | 未开始 |
 | 17 | LangGraph Checkpointer 持久化对话 | 未开始 |
 
@@ -731,5 +731,119 @@ print("最终结果：", result)
 - **先脱离 LLM 学 LangGraph**：这是这个仓库一贯的教学策略——每次只引入一个新概念。前面 12 步已经很熟悉“怎么调用 LLM”了，这一步的重点是搞懂 LangGraph 这套新的编排方式本身（State/Node/Edge/compile），如果例子里同时还带着 LLM 调用、Prompt 模板，反而会分散注意力，分不清哪部分是 LangGraph 独有的新东西。
 - **为什么明明前面 12 步的 LCEL 已经能用了，还要学一套新的**：LCEL 的 `|` 本质上是“单向直线流水线”，`a | b | c` 里 `a` 只能流向 `b`。但 Agent 场景天然需要“循环”（调用工具后要回到模型再判断一次“还要不要继续调用工具”）和“分支”（不同情况走不同节点）——这些用纯 `|` 语法很难表达清楚，而图结构天然支持“任意两个节点之间连边”，包括从后面的节点连回前面的节点（形成循环）。下一步讲条件边、之后手写 Agent 循环时，会直接用到这个特性。
 - **节点函数只返回“要更新的字段”而不是完整 State**：这是 LangGraph 默认的合并（reducer）行为——新返回的字典会和已有 state 做合并更新，而不是整个替换掉。等后面遇到需要“累加”而不是“覆盖”的字段（比如对话历史消息列表，新消息应该追加而不是覆盖掉旧消息），会看到 State 定义里可以给字段指定不同的合并方式，这里先了解默认行为是“覆盖同名字段”即可。
+
+## 第 14 步：LangGraph 条件边
+
+### 做了什么
+
+上一步的图是一条直线：`START → add_one → double → END`，不管输入是什么，走的路径都一样。真实场景里经常需要“根据当前状态决定下一步去哪”——这就是**条件边（Conditional Edge）**。
+
+新增 `14_langgraph_conditional_edges.py`，在上一步的基础上做了个小改动：只保留一个 `double` 节点，让它反复执行，直到 `count` 达到 100 才停下来：
+
+```python
+def double(state: State) -> State:
+    print(f"double 执行前：{state['count']}")
+    return {"count": state["count"] * 2}
+
+
+def should_continue(state: State) -> str:
+    if state["count"] < 100:
+        return "double"
+    return END
+
+
+graph_builder = StateGraph(State)
+graph_builder.add_node("double", double)
+graph_builder.add_edge(START, "double")
+graph_builder.add_conditional_edges("double", should_continue, {"double": "double", END: END})
+
+graph = graph_builder.compile()
+result = graph.invoke({"count": 1})
+```
+
+关键的一行是 `add_conditional_edges("double", should_continue, {...})`：
+
+- 第一个参数 `"double"`：从哪个节点出发判断。
+- 第二个参数 `should_continue`：一个“判断函数”，接收当前 state，返回一个字符串，代表接下来要去哪个节点。
+- 第三个参数 `{"double": "double", END: END}`：一份“路由表”，把 `should_continue` 可能返回的每个字符串，映射到真正的目标节点——这里 `should_continue` 返回 `"double"` 时就映射回 `"double"` 节点本身（也就是自己指向自己，形成一个循环），返回 `END` 时就映射到图的出口。
+
+运行结果：
+
+```
+double 执行前：1
+double 执行前：2
+double 执行前：4
+double 执行前：8
+double 执行前：16
+double 执行前：32
+double 执行前：64
+最终结果： {'count': 128}
+```
+
+`count` 从 1 开始不断翻倍，每次执行完 `double` 都会调用 `should_continue` 检查一遍：小于 100 就再跑一次 `double`，直到变成 128（第一次 ≥ 100）才停下来去到 `END`。
+
+> **踩坑记录**：一开始想顺便打印 `graph.get_graph().draw_ascii()` 看看这张图长什么样，结果 `grandalf`（上一步用来画图的库）在处理这种“节点指向自己”的自循环边时直接报错崩溃了（`ValueError: no intersection found`）。这不是我们代码写错了，是这个纯文本画图工具本身处理不了自循环这种拓扑结构，所以这一步就不追求把图画出来了——工具的能力边界也是需要在实践中发现的，遇到不支持的场景，绕开就好，不用纠结。
+
+### 为什么这样做
+
+- **条件边是 LangGraph 用来表达“分支”和“循环”的核心机制**：一个从 `should_continue` 出发的判断函数 + 一份路由表，既可以实现“根据情况走不同分支”（比如这里的“继续 vs 结束”），也可以实现“反复执行直到满足某个条件”（把某个分支指回自己）。第 8 步 `create_agent` 背后真正的循环逻辑——“调用模型 → 有没有工具调用请求？有就执行工具再回到模型；没有就结束”——本质上就是一个比这里复杂一点的条件边判断，下下一步手写 Agent 循环时会直接用到一模一样的机制。
+- **为什么先用一个和 LLM 无关的计数器例子，而不是直接就手写 Agent 循环**：条件边本身的语法（判断函数返回什么字符串、路由表怎么写）和“循环判断的具体业务逻辑是什么”是两件独立的事。先在一个只有一两行逻辑、结果可以一眼验证对不对的例子里把语法吃透（“1 翻倍到 128 停下”，一眼就能验证对不对），再去看“判断要不要继续调用工具”这种更复杂的业务逻辑，会更容易分清楚哪部分是 LangGraph 的固定写法、哪部分是我们自己要写的业务判断。
+
+## 第 15 步：LangGraph 接入 LLM 节点
+
+### 做了什么
+
+前两步的节点都是普通的数字运算，这一步让节点里真正调用一次 LLM。新增 `15_langgraph_llm_node.py`：
+
+```python
+class State(TypedDict):
+    messages: Annotated[list, add_messages]
+
+
+def chatbot(state: State) -> State:
+    return {"messages": [llm.invoke(state["messages"])]}
+
+
+graph_builder = StateGraph(State)
+graph_builder.add_node("chatbot", chatbot)
+graph_builder.add_edge(START, "chatbot")
+graph_builder.add_edge("chatbot", END)
+
+graph = graph_builder.compile()
+```
+
+这里的 State 定义呼应了第 13 步留下的伏笔：
+
+```python
+messages: Annotated[list, add_messages]
+```
+
+`Annotated[list, add_messages]` 的意思是：`messages` 这个字段是一个列表，并且当节点返回新的 `messages` 时，不要像第 13 步那样“覆盖”掉旧值，而是用 `add_messages` 这个 LangGraph 内置的合并函数（reducer）来处理——`add_messages` 会把新消息**追加**到旧列表后面（如果新消息和旧消息 id 相同，还会做替换/更新而不是重复追加，这里先不展开）。所以 `chatbot` 节点只需要返回“这一步新产生的那一条 AI 消息”，`{"messages": [llm.invoke(state["messages"])]}`，不用自己操心怎么拼接历史，LangGraph 会处理。
+
+用两轮对话验证了效果：
+
+```python
+result = graph.invoke({"messages": [("human", "我叫小明，最喜欢的水果是芒果。")]})
+# ... 打印 result["messages"]，此时是 [Human1, AI1] 两条
+
+result = graph.invoke({"messages": result["messages"] + [("human", "你还记得我的名字和喜欢的水果吗？")]})
+# ... 打印 result["messages"]，此时是 [Human1, AI1, Human2, AI2] 四条
+```
+
+运行结果，第二轮模型准确回答出了名字和水果：
+
+```
+Human: 我叫小明，最喜欢的水果是芒果。
+Ai: 哈哈，小明你好！芒果真的是超棒的水果呢...
+
+Human: 你还记得我的名字和喜欢的水果吗？
+Ai: 当然记得啦！你是小明，最爱吃的是芒果～...
+```
+
+### 为什么这样做
+
+- **`add_messages` 解决的正是第 13 步留下的问题**：第 13 步提到过，默认情况下节点返回的字段会“覆盖”掉 state 里的同名字段，但对话历史这种场景，我们想要的是“追加”而不是“覆盖”——`Annotated[list, add_messages]` 就是显式告诉 LangGraph：这个字段用另一套合并规则。这是 LangGraph 里非常常见的写法，`create_agent` 内部维护对话状态用的也是同一个 `add_messages`。
+- **为什么每轮手动把 `result["messages"]` 拼接后再传给下一次 `invoke`，而不是让图自己记住**：`graph.invoke(...)` 每次调用都是一次完全独立、无状态的执行——这次调用不知道上次调用发生过什么，图本身不会跨越多次 `invoke()` 自动保留状态。所以要实现多轮对话，必须（和第 7 步手写 `history` 列表的思路完全一致）把上一轮的完整消息列表交给这一轮当作输入的一部分。下一步会介绍 LangGraph 官方的 **Checkpointer**，可以让图自动记住每个对话的历史，不用再手动拼接，但理解“不用它的话本质上要做什么”，能让之后用 Checkpointer 时更清楚它到底帮你省了什么。
+- **`("human", "...")` 这种二元组写法**：这是 LangChain 消息的一种简写形式，等价于 `HumanMessage(content="...")`，`add_messages` 在合并时会自动把这种简写转换成正式的消息对象——这也是为什么打印 `result["messages"]` 时看到的是完整的 `HumanMessage`/`AIMessage`，而不是原始传入的元组。
 - **`vector_store.json` 和 `vector_store.hash` 都不提交进 Git**：和 `.venv` 一样，它们都是可以从源头（`data/company_faq.txt` + 相同的 embedding 模型）重新生成出来的**派生产物**，不是需要手工维护的源文件，所以都加进了 `.gitignore`。真正该提交的是 `data/company_faq.txt` 这个原始数据，任何人拿到仓库、跑一次脚本，都能自己生成出一样的向量库和哈希文件。
 - **为什么继续用 `InMemoryVectorStore` 而不是直接换成 Chroma/Postgres 等专业的持久化向量数据库**：教学阶段的核心是先理解“持久化”这个概念本身——省去重复计算、数据能跨进程存活。`InMemoryVectorStore.dump()/load()` 用一个 JSON 文件就做到了这一点，不需要再学一个新的数据库系统。等文档量大到一个 JSON 文件不再合适（比如要支持多用户并发读写、要做增量更新），再换成 Chroma、Postgres+pgvector 这类专业方案，那时候 `similarity_search()` 之类的检索代码基本不用改，改的只是vector store 的初始化方式。
