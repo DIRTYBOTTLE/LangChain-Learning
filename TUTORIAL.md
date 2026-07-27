@@ -24,6 +24,11 @@
 | 10 | 流式输出 Streaming | ✅ 已完成 |
 | 11 | 持久化向量库 | ✅ 已完成 |
 | 12 | 整合成一个小应用 | ✅ 已完成 |
+| 13 | LangGraph 基础概念 | ✅ 已完成 |
+| 14 | LangGraph 条件边 | ⏳ 进行中 |
+| 15 | LangGraph 接入 LLM 节点 | 未开始 |
+| 16 | LangGraph 手写工具调用循环 | 未开始 |
+| 17 | LangGraph Checkpointer 持久化对话 | 未开始 |
 
 ---
 
@@ -645,5 +650,86 @@ while True:
 - **把 RAG 做成工具，而不是硬编码在每次请求里**：如果每次提问都无条件先做一次向量检索、再把结果塞进 prompt，遇到“你好”“你是谁”这种不需要查资料的问题，也会白白多消耗一次检索和一些无关的上下文。让 Agent 自己判断要不要调用工具，是更贴近真实产品的做法——这也是为什么真实的 RAG 应用，很多时候实际上是“RAG + Agent”的组合，而不是一条写死的检索链。
 - **这一步没有引入任何新概念**：所有用到的组件（`@tool`、`create_agent`、消息列表维护的多轮记忆、持久化向量库）在前面的步骤里都单独学过。把它们组合在一起、能不能跑得通、组合后行为符不符合预期，本身就是对前 11 步理解程度的一次检验——如果中间任何一环没搞懂，这一步大概率会在某个地方卡住或者行为不符合预期。
 - **脚本复用第 11 步的加载/构建函数，而不是要求先跑另一个脚本**：延续了这个仓库“每个脚本独立可运行”的约定（见 `CLAUDE.md`），代价是这个函数在两个文件里各写了一份、有一点重复；对于教学项目，这种重复是有意为之的取舍——比起为了不重复代码去抽出一个共享模块、让读者还要理解“文件之间怎么互相导入”，保持每个文件可以独立复制运行更符合这个仓库的教学目标。
+
+---
+
+# LangGraph 篇
+
+前面 12 步用的都是 LCEL（`prompt | llm | parser` 这种用 `|` 拼起来的链）。LCEL 很适合“一条直线走到底”的流程，但如果流程本身需要**循环**（比如 Agent 反复调用工具直到任务完成）、**分支**（根据上一步的结果决定走哪条路）、或者需要**中途暂停等人工确认**，用 `|` 拼接就会变得很别扭。实际上第 8 步的 `create_agent`、包括这个项目里所有用到 Agent 的地方，底层都是用 **LangGraph** 实现的——这一篇就是要打开这个“底层”，搞清楚 `create_agent` 到底是怎么用 LangGraph 拼出来的。
+
+## 第 13 步：LangGraph 基础概念
+
+### 做了什么
+
+LangGraph 把“程序的执行流程”建模成一张**图（Graph）**：图上的每个**节点（Node）**是一个处理步骤，节点之间用**边（Edge）**连接表示“做完这一步之后去做哪一步”，整张图共享同一份**状态（State）**，每个节点读取状态、做一些处理，再把更新写回状态。
+
+为了先把这三个概念（State / Node / Edge）单独搞清楚，新增的 `13_langgraph_basics.py` **完全没有用到任何 LLM**，只是一个把数字做两次运算的最小示例：
+
+```python
+from typing import TypedDict
+from langgraph.graph import StateGraph, START, END
+
+
+class State(TypedDict):
+    count: int
+
+
+def add_one(state: State) -> State:
+    return {"count": state["count"] + 1}
+
+
+def double(state: State) -> State:
+    return {"count": state["count"] * 2}
+
+
+graph_builder = StateGraph(State)
+graph_builder.add_node("add_one", add_one)
+graph_builder.add_node("double", double)
+graph_builder.add_edge(START, "add_one")
+graph_builder.add_edge("add_one", "double")
+graph_builder.add_edge("double", END)
+
+graph = graph_builder.compile()
+
+result = graph.invoke({"count": 1})
+print("最终结果：", result)
+```
+
+逐行拆解：
+
+- **`State`**：一个 `TypedDict`，描述了在图上流动的数据长什么样——这里只有一个字段 `count`。State 相当于 LCEL 里“上一环的输出格式必须是下一环认识的输入格式”这件事的显式声明：图上所有节点共享同一个 State 类型。
+- **节点（`add_one`、`double`）**：就是普通的 Python 函数，接收当前的 `state`，返回一个**要更新到 state 里的字典**（不需要返回完整的 state，只需要返回你想更新的那部分字段）。
+- **`StateGraph(State)`**：创建一个“图构建器”，告诉它这张图上流动的数据类型是 `State`。
+- **`add_node("add_one", add_one)`**：把函数 `add_one` 注册成图里一个叫 `"add_one"` 的节点（节点名字和函数变量名一致只是习惯，实际是两个独立的东西：一个是字符串标识符，一个是要执行的函数）。
+- **`add_edge(...)`**：定义节点之间的执行顺序。`START` 和 `END` 是 LangGraph 内置的两个特殊“节点”，分别代表“图的入口”和“图的出口”。这里连出了一条直线：`START → add_one → double → END`。
+- **`graph_builder.compile()`**：把搭好的图“编译”成一个可以真正运行的对象。编译后的 `graph` 和 LCEL 里的 `chain` 一样，也实现了 `invoke()`/`stream()` 这套统一接口——这不是巧合，图和链在 LangChain 的体系里都被当成同一种“可运行对象”。
+
+运行 `graph.invoke({"count": 1})`，`count` 从 `1` 先被 `add_one` 变成 `2`，再被 `double` 变成 `4`，最终结果是 `{'count': 4}`。脚本里还打印了 `graph.get_graph().draw_ascii()`（需要额外装一个很轻量的 `grandalf` 包）画出的图结构：
+
+```
++-----------+
+| __start__ |
++-----------+
+      *
+ +---------+
+ | add_one |
+ +---------+
+      *
+  +--------+
+  | double |
+  +--------+
+      *
+ +---------+
+ | __end__ |
+ +---------+
+```
+
+> **踩坑记录**：一开始 `requirements.txt` 里没有单独列 `langgraph`，代码却能正常 `import langgraph`——因为 `langchain`（准确说是 `langchain.agents.create_agent` 这些功能）本身就依赖 `langgraph`，装 `langchain` 的时候把它顺带装上了。但“能跑”不代表“这么写是对的”：我们的代码里直接 `import langgraph`，就应该在 `requirements.txt` 里把它列为**直接依赖**并锁定版本，而不是依赖“正好被另一个包顺带装上”这种偶然性。如果以后 `langchain` 调整了自己的依赖关系（比如换了个更低的 `langgraph` 版本要求，或者把 agent 功能拆到了另一个包），这里的 `import langgraph` 可能会在没有任何警告的情况下突然出问题。修复方式很简单：把 `langgraph==1.2.9` 显式加进 `requirements.txt`。这也是判断“一个包该不该写进 requirements.txt”的通用标准——**只要代码里直接 `import` 了它，就应该显式声明**，不管它是不是恰好已经被别的依赖带进来了。
+
+### 为什么这样做
+
+- **先脱离 LLM 学 LangGraph**：这是这个仓库一贯的教学策略——每次只引入一个新概念。前面 12 步已经很熟悉“怎么调用 LLM”了，这一步的重点是搞懂 LangGraph 这套新的编排方式本身（State/Node/Edge/compile），如果例子里同时还带着 LLM 调用、Prompt 模板，反而会分散注意力，分不清哪部分是 LangGraph 独有的新东西。
+- **为什么明明前面 12 步的 LCEL 已经能用了，还要学一套新的**：LCEL 的 `|` 本质上是“单向直线流水线”，`a | b | c` 里 `a` 只能流向 `b`。但 Agent 场景天然需要“循环”（调用工具后要回到模型再判断一次“还要不要继续调用工具”）和“分支”（不同情况走不同节点）——这些用纯 `|` 语法很难表达清楚，而图结构天然支持“任意两个节点之间连边”，包括从后面的节点连回前面的节点（形成循环）。下一步讲条件边、之后手写 Agent 循环时，会直接用到这个特性。
+- **节点函数只返回“要更新的字段”而不是完整 State**：这是 LangGraph 默认的合并（reducer）行为——新返回的字典会和已有 state 做合并更新，而不是整个替换掉。等后面遇到需要“累加”而不是“覆盖”的字段（比如对话历史消息列表，新消息应该追加而不是覆盖掉旧消息），会看到 State 定义里可以给字段指定不同的合并方式，这里先了解默认行为是“覆盖同名字段”即可。
 - **`vector_store.json` 和 `vector_store.hash` 都不提交进 Git**：和 `.venv` 一样，它们都是可以从源头（`data/company_faq.txt` + 相同的 embedding 模型）重新生成出来的**派生产物**，不是需要手工维护的源文件，所以都加进了 `.gitignore`。真正该提交的是 `data/company_faq.txt` 这个原始数据，任何人拿到仓库、跑一次脚本，都能自己生成出一样的向量库和哈希文件。
 - **为什么继续用 `InMemoryVectorStore` 而不是直接换成 Chroma/Postgres 等专业的持久化向量数据库**：教学阶段的核心是先理解“持久化”这个概念本身——省去重复计算、数据能跨进程存活。`InMemoryVectorStore.dump()/load()` 用一个 JSON 文件就做到了这一点，不需要再学一个新的数据库系统。等文档量大到一个 JSON 文件不再合适（比如要支持多用户并发读写、要做增量更新），再换成 Chroma、Postgres+pgvector 这类专业方案，那时候 `similarity_search()` 之类的检索代码基本不用改，改的只是vector store 的初始化方式。
