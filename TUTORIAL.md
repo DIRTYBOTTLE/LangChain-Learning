@@ -27,7 +27,7 @@
 | 13 | LangGraph 基础概念 | ✅ 已完成 |
 | 14 | LangGraph 条件边 | ✅ 已完成 |
 | 15 | LangGraph 接入 LLM 节点 | ✅ 已完成 |
-| 16 | LangGraph 手写工具调用循环 | 未开始 |
+| 16 | LangGraph 手写工具调用循环 | ✅ 已完成 |
 | 17 | LangGraph Checkpointer 持久化对话 | 未开始 |
 
 ---
@@ -845,5 +845,62 @@ Ai: 当然记得啦！你是小明，最爱吃的是芒果～...
 - **`add_messages` 解决的正是第 13 步留下的问题**：第 13 步提到过，默认情况下节点返回的字段会“覆盖”掉 state 里的同名字段，但对话历史这种场景，我们想要的是“追加”而不是“覆盖”——`Annotated[list, add_messages]` 就是显式告诉 LangGraph：这个字段用另一套合并规则。这是 LangGraph 里非常常见的写法，`create_agent` 内部维护对话状态用的也是同一个 `add_messages`。
 - **为什么每轮手动把 `result["messages"]` 拼接后再传给下一次 `invoke`，而不是让图自己记住**：`graph.invoke(...)` 每次调用都是一次完全独立、无状态的执行——这次调用不知道上次调用发生过什么，图本身不会跨越多次 `invoke()` 自动保留状态。所以要实现多轮对话，必须（和第 7 步手写 `history` 列表的思路完全一致）把上一轮的完整消息列表交给这一轮当作输入的一部分。下一步会介绍 LangGraph 官方的 **Checkpointer**，可以让图自动记住每个对话的历史，不用再手动拼接，但理解“不用它的话本质上要做什么”，能让之后用 Checkpointer 时更清楚它到底帮你省了什么。
 - **`("human", "...")` 这种二元组写法**：这是 LangChain 消息的一种简写形式，等价于 `HumanMessage(content="...")`，`add_messages` 在合并时会自动把这种简写转换成正式的消息对象——这也是为什么打印 `result["messages"]` 时看到的是完整的 `HumanMessage`/`AIMessage`，而不是原始传入的元组。
+
+## 第 16 步：LangGraph 手写工具调用循环
+
+### 做了什么
+
+这一步是前面几步的汇合点：把第 8 步手写过的“工具调用循环”，用第 14 步学的条件边、第 15 步学的 LLM 节点，在 LangGraph 里完整重新搭一遍——这也正是 `create_agent` 内部真正在做的事情。
+
+新增 `16_langgraph_tool_loop.py`，工具定义和第 8 步完全一样（`get_weather`、`add`），图搭成这样：
+
+```python
+def chatbot(state: State) -> State:
+    return {"messages": [llm_with_tools.invoke(state["messages"])]}
+
+
+def tool_executor(state: State) -> State:
+    last_message = state["messages"][-1]
+    results = [tools_by_name[call["name"]].invoke(call) for call in last_message.tool_calls]
+    return {"messages": results}
+
+
+def should_continue(state: State) -> str:
+    last_message = state["messages"][-1]
+    if last_message.tool_calls:
+        return "tools"
+    return END
+
+
+graph_builder = StateGraph(State)
+graph_builder.add_node("chatbot", chatbot)
+graph_builder.add_node("tools", tool_executor)
+graph_builder.add_edge(START, "chatbot")
+graph_builder.add_conditional_edges("chatbot", should_continue, {"tools": "tools", END: END})
+graph_builder.add_edge("tools", "chatbot")
+
+graph = graph_builder.compile()
+```
+
+三个节点/边搭出的执行流程是：
+
+```
+START → chatbot → (有工具调用请求？)
+                     ├─ 是 → tools → chatbot → (再判断一次)
+                     └─ 否 → END
+```
+
+- **`chatbot` 节点**：把当前消息历史交给绑定了工具的模型（`llm_with_tools = llm.bind_tools(tools)`），模型这一步要么直接给出最终回答，要么在返回的消息里带上 `tool_calls`（“我想调用哪个工具、参数是什么”）。
+- **`tool_executor` 节点**：读取上一条消息（一定是 `chatbot` 刚生成的）里的 `tool_calls`，真正执行对应的工具函数，把每个工具的执行结果包装成 `ToolMessage` 返回——这一步和第 8 步手写的 `for tool_call in ai_message.tool_calls: ...` 循环体几乎一模一样，只是这次是图上的一个节点。
+- **`should_continue` 判断函数**：检查最新一条消息有没有 `tool_calls`。有，就说明模型还想调用工具，走向 `"tools"` 节点；没有，说明模型已经给出了不需要再查资料的最终回答，直接走向 `END`。
+- **`add_edge("tools", "chatbot")`**：工具执行完，一定要回到 `chatbot`，把工具结果交给模型看一眼、生成下一步的反应（可能是最终回答，也可能是决定再调用一次别的工具）——这一条边，加上 `should_continue` 里“还有 `tool_calls` 就继续走 `tools`”，两者共同构成了一个**循环**：`chatbot ⇄ tools`，直到模型不再请求工具为止。
+
+运行同一个问题（“上海天气怎么样？另外，3.5 加 2.7 等于多少？”），结果和第 8 步的 `create_agent` 一致：模型一次性并行发起了 `get_weather` 和 `add` 两个工具调用，两个 `ToolMessage` 都被塞回历史后，模型才给出汇总了两个结果的最终回答。
+
+### 为什么这样做
+
+- **这就是 `create_agent` 的真面目**：第 8 步用 `create_agent(llm, tools=tools)` 一行代码就拿到的能力，本质上就是这里手写的这几个节点、一条条件边、一条回边组成的图。理解了这张图，`create_agent` 就不再是一个“魔法黑盒”——它只是把这套标准的“模型节点 + 工具节点 + 条件边循环”模式封装成了一个函数调用，让你不用每次都手写一遍。
+- **为什么值得先手写一遍，而不是一直用 `create_agent`**：`create_agent` 满足不了的场景（比如想在工具执行前后插入一个自定义的日志/审核节点、想让某些工具调用需要人工确认才能继续执行、想让图在执行到一半时可以暂停和恢复）都需要直接操作这张图。等真的遇到 `create_agent` 参数满足不了的定制需求时，回头看这个例子，就知道该怎么在图里插入自己的节点和边。
+- **`tool_executor` 里用列表推导式一次处理所有 `tool_calls`，对应了模型可能“并行调用多个工具”的情况**：和第 8 步手写的 `for` 循环思路一致，只是写得更紧凑；这里也再次印证了 LangGraph 的图结构天然能表达“模型一步产生多个待办事项，一次性并行处理完再继续”这种场景，而不需要额外的特殊语法。
 - **`vector_store.json` 和 `vector_store.hash` 都不提交进 Git**：和 `.venv` 一样，它们都是可以从源头（`data/company_faq.txt` + 相同的 embedding 模型）重新生成出来的**派生产物**，不是需要手工维护的源文件，所以都加进了 `.gitignore`。真正该提交的是 `data/company_faq.txt` 这个原始数据，任何人拿到仓库、跑一次脚本，都能自己生成出一样的向量库和哈希文件。
 - **为什么继续用 `InMemoryVectorStore` 而不是直接换成 Chroma/Postgres 等专业的持久化向量数据库**：教学阶段的核心是先理解“持久化”这个概念本身——省去重复计算、数据能跨进程存活。`InMemoryVectorStore.dump()/load()` 用一个 JSON 文件就做到了这一点，不需要再学一个新的数据库系统。等文档量大到一个 JSON 文件不再合适（比如要支持多用户并发读写、要做增量更新），再换成 Chroma、Postgres+pgvector 这类专业方案，那时候 `similarity_search()` 之类的检索代码基本不用改，改的只是vector store 的初始化方式。
