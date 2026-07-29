@@ -29,6 +29,7 @@
 | 15 | LangGraph 接入 LLM 节点 | ✅ 已完成 |
 | 16 | LangGraph 手写工具调用循环 | ✅ 已完成 |
 | 17 | LangGraph Checkpointer 持久化对话 | ✅ 已完成 |
+| 18 | LangGraph Human-in-the-loop 人工介入 | ✅ 已完成 |
 
 ---
 
@@ -939,6 +940,77 @@ result = graph.invoke({"messages": [("human", "你还记得我的名字和喜欢
 
 - **Checkpointer 帮我们省下的，正是第 7/15 步里手写的“拼接历史”这一步**：不用再自己维护一个 Python 列表、每次调用前手动拼接——只要 `thread_id` 一致，图会自动把这个对话的历史续上。这在有多个用户同时使用同一个应用时尤其重要：每个用户一个独立的 `thread_id`，就能天然地把所有人的对话历史互不干扰地分开管理，不用自己写一套“按用户 ID 存取历史”的逻辑。
 - **`InMemorySaver` 和 `InMemoryVectorStore` 面临同样的取舍**：数据存在进程内存里，进程一退出历史就没了，仅适合学习和本地实验。LangGraph 也提供了 `SqliteSaver`、`PostgresSaver` 等持久化到磁盘/数据库的 Checkpointer 实现，接口用法（`compile(checkpointer=...)`、靠 `thread_id` 区分会话）是完全一致的，真到生产环境按需要换掉 `InMemorySaver` 就行，不需要改动图的结构或者业务逻辑代码。
-- **走到这一步，第 7 步留下的“手写 `history` 列表”这条线，和第 15 步“每轮手动拼接 `result["messages"]`”这条线，都在这里有了官方的、更省心的替代方案**——但正因为前面几步是手写的，才能一眼看出 Checkpointer 到底帮我们自动做了什么（“按 `thread_id` 存取历史 + 用 `add_messages` 合并”），而不是把它当成一个只知道“能用”却不知道原理的黑盒。至此，从最基础的一次 LLM 调用，到能记忆、能调用工具、能检索资料、能自动管理多用户对话状态的完整链路，就都学完了。
+- **走到这一步，第 7 步留下的“手写 `history` 列表”这条线，和第 15 步“每轮手动拼接 `result["messages"]`”这条线，都在这里有了官方的、更省心的替代方案**——但正因为前面几步是手写的，才能一眼看出 Checkpointer 到底帮我们自动做了什么（“按 `thread_id` 存取历史 + 用 `add_messages` 合并”），而不是把它当成一个只知道“能用”却不知道原理的黑盒。
+
+## 第 18 步：Human-in-the-loop 人工介入
+
+### 做了什么
+
+第 16 步手写的工具调用循环里，模型一旦决定要调用某个工具，代码会**立刻**执行它，中间没有任何人插手的机会。真实场景里，有些操作风险较高（比如转账、删除数据、发送对外邮件），我们会希望模型“先说出它想干什么，等人确认了再真正执行”。LangGraph 提供了 `interrupt()` 函数，可以让图在执行到某一行代码时**暂停下来**，把这个节点余下的执行“冻结”，返回控制权给外面的程序；外面的程序问完人类、拿到答案后，再用 `Command(resume=答案)` 把这个节点从暂停的地方**接着**执行下去。
+
+新增 `18_langgraph_human_in_the_loop.py`，在第 16 步的图的基础上，只改了 `tool_executor` 这一个节点：
+
+```python
+def tool_executor(state: State) -> State:
+    last_message = state["messages"][-1]
+    results = []
+    for call in last_message.tool_calls:
+        approved = interrupt(
+            {"question": f"模型想调用工具 {call['name']}，参数 {call['args']}，是否允许？(yes/no)"}
+        )
+        if approved == "yes":
+            output = tools_by_name[call["name"]].invoke(call)
+        else:
+            output = ToolMessage(content="用户拒绝了这次工具调用。", tool_call_id=call["id"])
+        results.append(output)
+    return {"messages": results}
+```
+
+图编译时必须带上 `checkpointer`（这里还是用第 17 步的 `InMemorySaver`）——`interrupt()` 依赖它来保存“暂停那一刻”的完整状态，不然“恢复执行”就无从谈起。调用方这边的处理逻辑：
+
+```python
+result = graph.invoke({"messages": [("human", "北京天气怎么样？")]}, config=config)
+
+while "__interrupt__" in result:
+    question = result["__interrupt__"][0].value["question"]
+    answer = input(f"[需要人工确认] {question} ")
+    result = graph.invoke(Command(resume=answer), config=config)
+```
+
+分别测试了“批准”和“拒绝”两种场景：
+
+**输入 `yes`**：
+
+```
+[需要人工确认] 模型想调用工具 get_weather，参数 {'city': '北京'}，是否允许？(yes/no)
+...
+Tool Message
+Name: get_weather
+晴，25°C
+...
+Ai Message
+北京现在的天气是晴天，气温 25°C...
+```
+
+**输入 `no`**：
+
+```
+[需要人工确认] 模型想调用工具 get_weather，参数 {'city': '北京'}，是否允许？(yes/no)
+...
+Tool Message
+用户拒绝了这次工具调用。
+...
+Ai Message
+抱歉，我暂时无法获取到北京的天气信息...建议您可以通过以下方式查看北京的天气...
+```
+
+两种情况模型都表现得很自然：批准了就正常给出查到的天气；拒绝了模型也没有卡住或报错，而是礼貌地说明拿不到信息、并给出了替代建议。
+
+### 为什么这样做
+
+- **`interrupt()` 暂停的是“节点的执行”，不是“整个程序”**：调用 `graph.invoke(...)` 遇到 `interrupt()` 时会正常返回（不是抛异常卡死），返回结果里带一个 `"__interrupt__"` 键，程序可以用这个键判断“图是主动结束了，还是被暂停了、在等待外部输入”。这种“返回而不是阻塞”的设计，使得它同样适用于 Web 服务这种场景——请求 A 让图暂停后，服务器完全可以先处理别的请求，等用户在页面上点了“确认”按钮，再发一个新请求带着 `Command(resume=...)` 把之前那次执行接着跑完，不需要为了等一个人的操作而占着一个线程死等。
+- **为什么必须要有 `checkpointer` 才能用 `interrupt()`**：图“暂停”意味着它的执行状态（这一步之前的所有消息历史、当前在哪个节点、循环执行到第几轮）需要被完整保存下来，等恢复的时候才能从暂停的地方继续，而不是从头再来一遍。这份状态到底存在哪，正是 `checkpointer` 负责的事——`interrupt()` 和 `Checkpointer` 是配套的两个机制，缺一不可。
+- **用 `while "__interrupt__" in result` 循环处理，而不是假设只会暂停一次**：这一版例子里，一次提问最多触发一次工具调用、一次确认，但真实场景里模型可能连续调用好几轮不同的工具，每一轮都可能需要确认。写成循环是为了让代码对“暂停零次、一次、还是好几次”都成立，不用针对轮数写死逻辑。
+- **这一步走完，从“模型决定做什么”到“真的去执行”之间，多了一道可以插入任意校验逻辑的关卡**——不仅可以是这里演示的“人工 yes/no 确认”，同样的机制也能用来接入更复杂的自动化审核（比如先检查参数是否在允许范围内，只有超出范围的高风险操作才真正弹给人确认），`interrupt()` 提供的是这个“暂停 - 恢复”的底层能力，具体审核逻辑完全由使用者决定。
 - **`vector_store.json` 和 `vector_store.hash` 都不提交进 Git**：和 `.venv` 一样，它们都是可以从源头（`data/company_faq.txt` + 相同的 embedding 模型）重新生成出来的**派生产物**，不是需要手工维护的源文件，所以都加进了 `.gitignore`。真正该提交的是 `data/company_faq.txt` 这个原始数据，任何人拿到仓库、跑一次脚本，都能自己生成出一样的向量库和哈希文件。
 - **为什么继续用 `InMemoryVectorStore` 而不是直接换成 Chroma/Postgres 等专业的持久化向量数据库**：教学阶段的核心是先理解“持久化”这个概念本身——省去重复计算、数据能跨进程存活。`InMemoryVectorStore.dump()/load()` 用一个 JSON 文件就做到了这一点，不需要再学一个新的数据库系统。等文档量大到一个 JSON 文件不再合适（比如要支持多用户并发读写、要做增量更新），再换成 Chroma、Postgres+pgvector 这类专业方案，那时候 `similarity_search()` 之类的检索代码基本不用改，改的只是vector store 的初始化方式。
