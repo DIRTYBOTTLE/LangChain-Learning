@@ -4,3 +4,4 @@ __pycache__/
 .env
 vector_store.json
 vector_store.hash
+checkpoints.sqlite

@@ -30,6 +30,7 @@
 | 16 | LangGraph 手写工具调用循环 | ✅ 已完成 |
 | 17 | LangGraph Checkpointer 持久化对话 | ✅ 已完成 |
 | 18 | LangGraph Human-in-the-loop 人工介入 | ✅ 已完成 |
+| 19 | LangGraph SQLite Checkpointer 持久化会话 | ✅ 已完成 |
 
 ---
 
@@ -1014,3 +1015,57 @@ Ai Message
 - **这一步走完，从“模型决定做什么”到“真的去执行”之间，多了一道可以插入任意校验逻辑的关卡**——不仅可以是这里演示的“人工 yes/no 确认”，同样的机制也能用来接入更复杂的自动化审核（比如先检查参数是否在允许范围内，只有超出范围的高风险操作才真正弹给人确认），`interrupt()` 提供的是这个“暂停 - 恢复”的底层能力，具体审核逻辑完全由使用者决定。
 - **`vector_store.json` 和 `vector_store.hash` 都不提交进 Git**：和 `.venv` 一样，它们都是可以从源头（`data/company_faq.txt` + 相同的 embedding 模型）重新生成出来的**派生产物**，不是需要手工维护的源文件，所以都加进了 `.gitignore`。真正该提交的是 `data/company_faq.txt` 这个原始数据，任何人拿到仓库、跑一次脚本，都能自己生成出一样的向量库和哈希文件。
 - **为什么继续用 `InMemoryVectorStore` 而不是直接换成 Chroma/Postgres 等专业的持久化向量数据库**：教学阶段的核心是先理解“持久化”这个概念本身——省去重复计算、数据能跨进程存活。`InMemoryVectorStore.dump()/load()` 用一个 JSON 文件就做到了这一点，不需要再学一个新的数据库系统。等文档量大到一个 JSON 文件不再合适（比如要支持多用户并发读写、要做增量更新），再换成 Chroma、Postgres+pgvector 这类专业方案，那时候 `similarity_search()` 之类的检索代码基本不用改，改的只是vector store 的初始化方式。
+
+---
+
+## 第 19 步：LangGraph SQLite Checkpointer 持久化会话
+
+### 做了什么
+
+第 17 步的 `InMemorySaver` 已经让图能按 `thread_id` 自动续接对话，但它只把快照留在 Python 进程的内存里：脚本一结束，全部历史都会消失。这一步新增 `19_langgraph_sqlite_checkpointer.py`，把同一个图换成 `SqliteSaver`，将 Checkpoint 写入脚本同目录的 `checkpoints.sqlite` 文件。
+
+由于 SQLite Checkpointer 是 LangGraph 的独立扩展包，`requirements.txt` 新增了直接依赖：
+
+```text
+langgraph-checkpoint-sqlite==3.1.0
+```
+
+核心变化只有两处：导入 `SqliteSaver`，并在编译图时把它传给 `checkpointer`：
+
+```python
+from pathlib import Path
+
+from langgraph.checkpoint.sqlite import SqliteSaver
+
+
+database_path = Path(__file__).with_name("checkpoints.sqlite")
+
+with SqliteSaver.from_conn_string(str(database_path)) as checkpointer:
+    graph = graph_builder.compile(checkpointer=checkpointer)
+    config = {"configurable": {"thread_id": "xiaoming-sqlite"}}
+
+    result = graph.invoke(
+        {"messages": [("human", "我叫小明，最喜欢的水果是芒果。")]},
+        config=config,
+    )
+    print("助手：", result["messages"][-1].content)
+
+    result = graph.invoke(
+        {"messages": [("human", "你还记得我的名字和喜欢的水果吗？")]},
+        config=config,
+    )
+    print("助手：", result["messages"][-1].content)
+```
+
+第一次运行时，SQLite 会创建 `checkpoints.sqlite` 及所需的表；第二次运行时会打开同一个数据库。由于两次都使用 `"xiaoming-sqlite"` 这个 `thread_id`，图会读取之前存下的 `messages`，所以即使 Python 进程已经退出，第二个问题依然可以从历史中找到“小明”和“芒果”。
+
+`with ... as checkpointer` 是一个上下文管理器：离开缩进块后会关闭 SQLite 连接。这一点在 Windows 上特别实用，避免脚本结束后数据库文件仍被占用，导致后续程序无法打开、移动或删除它。
+
+`checkpoints.sqlite` 已加入 `.gitignore`。它和第 11 步生成的向量库一样属于本地运行产生的数据，不应随着教程源码提交；如果想从零开始重新体验本节，只要关闭所有使用它的脚本后删除这个文件，再运行一次即可。
+
+### 为什么这样做
+
+- **只替换 Checkpointer，不改图的节点和边**：`InMemorySaver` 与 `SqliteSaver` 都遵守同一个 Checkpointer 接口，因此 `State`、`chatbot` 节点、`add_messages` reducer 和 `thread_id` 的用法完全不变。这说明持久化是图运行时的基础设施选择，而不是要渗透到每个业务节点里的特殊逻辑。
+- **SQLite 适合单机教程和小型应用**：它是一个随 Python 一起可用的嵌入式数据库，没有独立服务要启动；一个文件就能保留多个 `thread_id` 的会话历史。多人、高并发或多台服务实例共享状态的生产场景，则更适合换成 Postgres 等服务端 Checkpointer，图的其余部分仍可保持不变。
+- **数据库记录的是 Checkpoint，不只是最后一句回复**：为了让 LangGraph 能在任意节点后续跑，或从 `interrupt()` 暂停处恢复，它需要保存完整的图状态及执行元数据。正因为保存的是这些快照，第 18 步的“暂停—人工确认—恢复”机制也可以在进程重启后继续使用；本节的对话记忆只是这个能力最直观的体现。
+- **`thread_id` 仍然是会话隔离边界**：SQLite 让数据跨进程存活，并不意味着所有用户共享记忆。把 `config` 改为另一个 `thread_id`，得到的仍是一个没有任何历史的新会话；实际应用通常用稳定的用户 ID、会话 ID 或其组合来生成它。
